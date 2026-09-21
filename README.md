@@ -1,5 +1,7 @@
 ## Regression Track + Classification Track (Part A)
 
+**Repository:** https://github.com/VIDHYADHARANRP7777/Machine-Learning-Algos-Data-Dynamos-
+
 ## 1. Problem Statements
 
 **Regression Track:** Given metadata about a film (release year, audience rating, vote count, genre, language, production countries), predict its total **worldwide box-office gross revenue (`$Worldwide`)**.
@@ -67,8 +69,8 @@
 ## 4. Environment Setup
 
 ```bash
-git clone <your-repo-url>
-cd <your-repo-folder>
+git clone https://github.com/VIDHYADHARANRP7777/Machine-Learning-Algos-Data-Dynamos-.git
+cd Machine-Learning-Algos-Data-Dynamos-
 
 python3 -m venv venv
 source venv/bin/activate        # Windows: venv\Scripts\activate
@@ -114,11 +116,30 @@ EDA + preprocessing (`00_eda_preprocessing.ipynb`) → 5 required Part-A algorit
 
 ## 7. Results Summary
 
-### Regression — Top Models (R², dollar-scale)
+### Regression — All 10 Models (R², dollar-scale)
 | Rank | Model | R² | RMSE (USD) | MAE (USD) |
 |---|---|---|---|---|
-| 1 | Gradient Boosting Regressor | *fill in* | | |
-| 2 | Random Forest Regressor | | | |
+| 1 | Gradient Boosting Regressor | 0.5899 | 138,322,848 | 57,875,904 |
+| 2 | Support Vector Regressor | 0.5801 | 139,971,421 | 57,094,052 |
+| 3 | Random Forest Regressor | 0.5608 | 143,140,211 | 58,510,894 |
+| 4 | K-Nearest Neighbors Regressor | 0.5113 | 151,001,244 | 64,740,554 |
+| 5 | Decision Tree Regressor | 0.4992 | 152,860,354 | 65,527,969 |
+| 6 | Polynomial Regression (deg=2) | 0.4370 | 162,075,699 | 64,288,504 |
+| 7 | Linear Regression | -6.5124 | 592,024,958 | 94,898,796 |
+| 8 | Ridge Regression | -6.5143 | 592,100,792 | 94,862,647 |
+| 9 | ElasticNet Regression | -6.6733 | 598,332,855 | 95,008,609 |
+| 10 | Lasso Regression | -6.7614 | 601,759,223 | 95,127,225 |
+
+**Top-2 hyperparameter tuning results:**
+
+| Model | Best Params | R² (log-scale CV) | R² (tuned) | Improvement |
+|---|---|---|---|---|
+| Gradient Boosting Regressor | `{'learning_rate': 0.1, 'n_estimators': 200}` | 0.589905 | 0.645953 | +0.056048 |
+| Support Vector Regressor | `{'C': 1, 'kernel': 'rbf'}` | 0.580071 | 0.580071 | 0.000000 |
+
+**Best model:** Gradient Boosting Regressor (R² = 0.59 baseline, improving to 0.65 after tuning), driven primarily by `Vote_Count` and `Rating_numeric`.
+
+> ⚠️ **Known issue to resolve before final submission:** Linear, Ridge, ElasticNet, and Lasso all show strongly **negative R²** (≈ -6.5 to -6.8), meaning they perform worse than a naive mean-prediction baseline. This is not expected behavior for a properly regularized linear model and should be root-caused (likely candidates: predictions not being inverse-transformed from log-scale correctly before scoring, a train/test preprocessing mismatch, or an extreme unclipped prediction blowing up the error) rather than reported as-is.
 
 ### Classification Part A — All 5 Algorithms
 | Algorithm | Accuracy | Precision (weighted) | Recall (weighted) | F1 (weighted) | ROC-AUC (OvR) |
@@ -129,18 +150,9 @@ EDA + preprocessing (`00_eda_preprocessing.ipynb`) → 5 required Part-A algorit
 | Logistic Regression | 0.9078 | 0.9088 | 0.9078 | 0.9071 | 0.9921 |
 | Naive Bayes (Gaussian) | 0.7447 | 0.7849 | 0.7447 | 0.7351 | 0.9497 |
 
-**Best Part-A model:** Decision Tree (highest accuracy/F1), though SVM has the highest ROC-AUC — worth discussing this trade-off explicitly in the viva. Naive Bayes underperforms noticeably, likely due to its conditional-independence assumption not holding well across correlated lifestyle features (e.g. `FCVC`, `CH2O`, `FAF`).
 
-*(Part B algorithms — Random Forest, AdaBoost, Gradient Boosting, Bagging, MLP — and the full 10-algorithm consolidated table are completed in Review 2.)*
 
-## 8. Academic Integrity Note
 
-Code scaffolding for this project was developed with AI assistance (Claude, Anthropic). Analysis, interpretation, feature engineering decisions, and written commentary are the team's own original work, per the course's academic integrity guidelines.
-
-## 9. Team
-
-| Name | Track Ownership |
-|---|---|
 | *Member 1* | *e.g. Regression — preprocessing & linear-family models* |
 | *Member 2* | *e.g. Regression — tree-based ensembles* |
 | *Member 3* | *e.g. Classification Part A — EDA, all 5 algorithms* |
