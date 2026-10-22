@@ -1,4 +1,5 @@
-"""Regression and Classification pages. The sidebar dropdown selects ONE view: Dataset & EDA, a single algorithm, or Compare all."""
+"""Regression and Classification pages. The sidebar dropdown selects ONE view: Dataset & EDA, a single algorithm, or Compare all.
+Now fully generic: works with ANY uploaded CSV. Users pick target and feature columns via dropdowns."""
 import json
 import matplotlib
 matplotlib.use("Agg")
@@ -16,7 +17,7 @@ import supervised as S
 
 PAL = px.colors.qualitative.Safe
 ABOUT = {
-    "Linear Regression": "Baseline ordinary least squares. Coefficients show each feature's linear effect on log gross.",
+    "Linear Regression": "Baseline ordinary least squares. Coefficients show each feature's linear effect on the target.",
     "Ridge Regression": "Linear model with L2 regularisation (tune alpha). Shrinks coefficients, handles correlated features.",
     "Lasso Regression": "Linear model with L1 regularisation. Can shrink coefficients exactly to zero (feature sparsity).",
     "ElasticNet Regression": "Combines L1 and L2 penalties (tune alpha and l1_ratio).",
@@ -55,13 +56,13 @@ def view_label(task, view):
 
 # --------------------------------------------------------------------- cached compute
 @st.cache_data(show_spinner=False)
-def c_reg_prepare(raw, test_size):
-    return S.reg_prepare(raw, test_size)
+def c_reg_prepare(raw, target_col, feature_cols_tuple, test_size, log_target):
+    return S.reg_prepare(raw, target_col, list(feature_cols_tuple), test_size, log_target)
 
 
 @st.cache_data(show_spinner=False)
-def c_clf_prepare(raw, test_size):
-    return S.clf_prepare(raw, test_size)
+def c_clf_prepare(raw, target_col, feature_cols_tuple, test_size):
+    return S.clf_prepare(raw, target_col, list(feature_cols_tuple), test_size)
 
 
 @st.cache_data(show_spinner=False, max_entries=64)
@@ -101,7 +102,8 @@ def grid_text(grid):
 
 def fmt_metrics(d, kind):
     if kind == "reg":
-        return {"R² (USD)": d["R2"], "RMSE (USD)": d["RMSE"], "MAE (USD)": d["MAE"], "R² (log scale)": d["R2_log"]}
+        tt = d.get("target_transform", "none") if isinstance(d, dict) else "none"
+        return {"R²": d["R2"], "RMSE": d["RMSE"], "MAE": d["MAE"], "R² (log scale)": d["R2_log"]}
     return {"Accuracy": d["Accuracy"], "Precision (wtd)": d["Precision"], "Recall (wtd)": d["Recall"], "F1 (wtd)": d["F1"], "ROC-AUC (OvR)": d["ROC_AUC"]}
 
 
@@ -114,7 +116,7 @@ def explain_reg_metrics():
 | **R² (Coefficient of Determination)** | −∞ to 1 | Higher (→ 1) | Proportion of variance explained by the model. 1 = perfect; 0 = as good as the mean; negative = worse than mean. |
 | **RMSE (Root Mean Squared Error)** | ≥ 0 | Lower (→ 0) | Square root of the average of squared differences between predicted and actual values. Sensitive to large errors. |
 | **MAE (Mean Absolute Error)** | ≥ 0 | Lower (→ 0) | Average of the absolute differences between predictions and actual values. More robust to outliers than RMSE. |
-| **R² (log scale)** | −∞ to 1 | Higher (→ 1) | R² computed on log-transformed target, showing fit on the scale the models were trained on. |
+| **R² (log scale)** | −∞ to 1 | Higher (→ 1) | R² computed on log-transformed target (if applicable), showing fit on the scale the models were trained on. |
 """)
 
 
@@ -136,7 +138,10 @@ def explain_clf_metrics():
 def cards(d, kind):
     f = fmt_metrics(d, kind)
     for c, (k, v) in zip(st.columns(len(f)), f.items()):
-        c.metric(k, f"{v:,.0f}" if "USD" in k and "R²" not in k else f"{v:.4f}")
+        if isinstance(v, float) and not np.isnan(v):
+            c.metric(k, f"{v:,.0f}" if abs(v) > 1000 else f"{v:.4f}")
+        else:
+            c.metric(k, "N/A")
 
 
 def importance_fig(df, title):
@@ -165,12 +170,39 @@ def ranked_table(rows, sort_key):
     return df
 
 
-def get_upload_or_default(label, key, hint):
+def get_upload(label, key):
     up = st.sidebar.file_uploader(label, type="csv", key=key)
     if up is not None:
         return pd.read_csv(up), f"uploaded file `{up.name}`"
-    st.info(f"⬅️ **Upload a CSV file** in the sidebar to begin. {hint}")
+    st.info(f"⬅️ **Upload a CSV file** in the sidebar to begin. Any CSV with numeric and/or categorical columns will work.")
     return None, None
+
+
+def column_selectors(raw, task, key_prefix):
+    """Let user pick target and feature columns from the uploaded CSV."""
+    all_cols = list(raw.columns)
+
+    # Guess a good default target: last column or first non-numeric
+    default_target_idx = len(all_cols) - 1
+    target_col = st.sidebar.selectbox(
+        "🎯 Target column",
+        all_cols,
+        index=default_target_idx,
+        key=f"{key_prefix}_target",
+        help="The column you want to predict."
+    )
+
+    # Default features: all columns except target
+    available_feats = [c for c in all_cols if c != target_col]
+    feature_cols = st.sidebar.multiselect(
+        "📋 Feature columns",
+        available_feats,
+        default=available_feats,
+        key=f"{key_prefix}_features",
+        help="Columns used as input features. Numeric columns are auto-detected."
+    )
+
+    return target_col, feature_cols
 
 
 def train_controls(prefix, name, spec_dict):
@@ -212,23 +244,31 @@ def render(task, view, hero):
 # ===================================================================== REGRESSION
 def _regression(view, hero):
     n = len(S.REG_SPECS)
-    hero(f"Regression · {view_label('Regression', view)}", f"{n} algorithms · box-office worldwide gross (log target, metrics in USD) · trained live on your settings")
-    raw, src = get_upload_or_default("Upload Box-office CSV", "reg_up",
-        "Please upload the box-office CSV (e.g. enhanced_box_office_data_2000-2024.csv) in the sidebar to begin.")
+    hero(f"Regression · {view_label('Regression', view)}", f"{n} algorithms · auto-detects features from your CSV · trained live on your settings")
+    raw, src = get_upload("Upload CSV for Regression", "reg_up")
     if raw is None:
         return
+
+    target_col, feature_cols = column_selectors(raw, "Regression", "reg")
+    if not feature_cols:
+        st.warning("Select at least one feature column in the sidebar.")
+        return
+
     test_size = st.sidebar.slider("Test set fraction", 0.1, 0.4, 0.2, 0.05, key="reg_ts")
+    log_target = st.sidebar.checkbox("Apply log1p to target (for skewed data)", value=True, key="reg_log")
+
     try:
-        data = c_reg_prepare(raw, test_size)
+        data = c_reg_prepare(raw, target_col, tuple(feature_cols), test_size, log_target)
     except Exception as e:  # noqa: BLE001
         st.error(f"Could not prepare the data: {e}")
         return
-    dkey = f"{pd.util.hash_pandas_object(raw, index=False).sum()}_{test_size}"
+    dkey = f"{pd.util.hash_pandas_object(raw, index=False).sum()}_{target_col}_{test_size}_{log_target}"
     m = data["meta"]
     a, b, c, d = st.columns(4)
     a.metric("Rows (after cleaning)", f"{m['rows']:,}"); b.metric("Duplicates removed", m["duplicates"])
     c.metric("Train rows", f"{len(data['X_train']):,}"); d.metric("Test rows", f"{len(data['X_test']):,}")
-    st.caption(f"Source: {src}. Same random split (random_state=42) for every algorithm, so comparisons are fair.")
+    st.caption(f"Source: {src}. Target: `{target_col}` | Features: {len(data['num_cols'])} numeric, {len(data['cat_cols'])} categorical | "
+               f"Transform: {data['target_transform']} | Same random split (random_state=42) for every algorithm.")
     if view == "Dataset & EDA":
         _reg_eda(raw, data)
     elif view == "Compare all algorithms":
@@ -238,19 +278,39 @@ def _regression(view, hero):
 
 
 def _reg_eda(raw, data):
-    st.markdown("**Preprocessing:** leakage columns (`$Domestic`, `$Foreign`, their %, `Rank`, `Release Group`) dropped; `Rating` parsed from `x.xxx/10`; "
-                "engineered `Genre_Count`, `Primary_Genre`, `Country_Count`, `Language_Grouped` (top-8 languages + Other), `Decade` (ordinal). "
-                "Imputation, scaling and one-hot encoding are inside the model pipeline, so they are fitted on training data only (also inside CV folds).")
+    st.markdown("**Preprocessing:** Numeric features are median-imputed and standardised. Categorical features are one-hot encoded. "
+                "All preprocessing happens inside the pipeline (fitted on training data only, also inside CV folds).")
     st.dataframe(raw.head(15), width="stretch")
-    y = np.expm1(pd.concat([data["y_train"], data["y_test"]]))
+
+    # Target distribution
+    tt = data.get("target_transform", "none")
+    y_all = np.concatenate([data["y_train"], data["y_test"]])
     f = go.Figure()
-    f.add_trace(go.Histogram(x=y, name="$Worldwide (raw)", nbinsx=50)); f.add_trace(go.Histogram(x=np.log1p(y), name="log1p($Worldwide)", nbinsx=50, xaxis="x2", opacity=.7))
-    f.update_layout(barmode="overlay", title="Target distribution: raw vs log1p", xaxis=dict(title="USD"), xaxis2=dict(title="log1p(USD)", overlaying="x", side="top"), yaxis_title="Count", height=380)
+    if tt == "log1p":
+        y_orig = np.expm1(y_all)
+        f.add_trace(go.Histogram(x=y_orig, name=f"{data['target_col']} (raw)", nbinsx=50))
+        f.add_trace(go.Histogram(x=y_all, name=f"log1p({data['target_col']})", nbinsx=50, xaxis="x2", opacity=.7))
+        f.update_layout(barmode="overlay", title="Target distribution: raw vs log1p",
+                       xaxis=dict(title="Raw"), xaxis2=dict(title="log1p", overlaying="x", side="top"),
+                       yaxis_title="Count", height=380)
+    else:
+        f.add_trace(go.Histogram(x=y_all, name=data["target_col"], nbinsx=50))
+        f.update_layout(title=f"Target distribution: {data['target_col']}", yaxis_title="Count", height=380)
     st.plotly_chart(f, width="stretch")
-    num = pd.concat([data["X_train"][S.REG_NUM], data["y_train"].rename("log1p($Worldwide)")], axis=1)
-    st.plotly_chart(px.imshow(num.corr().round(2), color_continuous_scale="RdBu_r", zmin=-1, zmax=1, text_auto=True, title="Correlation heatmap (training set)").update_layout(height=450), width="stretch")
-    feat = st.selectbox("Feature vs target", S.REG_NUM, key="reg_eda_feat")
-    st.plotly_chart(px.scatter(x=data["X_train"][feat], y=data["y_train"], opacity=.4, labels={"x": feat, "y": "log1p($Worldwide)"}, title=f"{feat} vs log1p($Worldwide)", color_discrete_sequence=[PAL[1]]).update_layout(height=380), width="stretch")
+
+    # Correlation heatmap for numeric features
+    if data["num_cols"]:
+        num_data = pd.concat([data["X_train"][data["num_cols"]], pd.Series(data["y_train"], name="target", index=data["X_train"].index)], axis=1)
+        st.plotly_chart(px.imshow(num_data.corr().round(2), color_continuous_scale="RdBu_r", zmin=-1, zmax=1, text_auto=True,
+                                  title="Correlation heatmap (training set, numeric features)").update_layout(height=450), width="stretch")
+
+    # Feature vs target scatter
+    if data["num_cols"]:
+        feat = st.selectbox("Feature vs target", data["num_cols"], key="reg_eda_feat")
+        st.plotly_chart(px.scatter(x=data["X_train"][feat], y=data["y_train"], opacity=.4,
+                                   labels={"x": feat, "y": f"target ({data['target_col']})"},
+                                   title=f"{feat} vs target",
+                                   color_discrete_sequence=[PAL[1]]).update_layout(height=380), width="stretch")
 
 
 def _reg_model(name, data, dkey):
@@ -269,39 +329,58 @@ def _reg_model(name, data, dkey):
         return
     st.subheader("Results")
     cards(res["metrics"], "reg")
-    st.caption("R² in USD is dominated by a few blockbusters and can be very negative if a model over-predicts exponentially; R² (log scale) shows fit on the scale the models were trained on.")
-    show_tuning(res, "reg"); show_cv(res, "R² (log scale)")
-    yt = np.expm1(data["y_test"].to_numpy()); yp = np.expm1(np.clip(res["pred_log"], -50, 50)); resid = yt - yp
-    logax = st.checkbox("Log axes for predicted-vs-actual", True, key="reg_logax")
+    tt = data.get("target_transform", "none")
+    if tt == "log1p":
+        st.caption("R² and RMSE/MAE are computed on the original scale (after inverse log1p). R² (log scale) shows fit on the training scale.")
+    show_tuning(res, "reg"); show_cv(res, "R²")
+
+    # Predicted vs actual
+    if tt == "log1p":
+        yt = np.expm1(data["y_test"]); yp = np.expm1(np.clip(res["pred_log"], -50, 50))
+    else:
+        yt = np.array(data["y_test"]); yp = np.array(res["pred_log"])
+    resid = yt - yp
+    logax = st.checkbox("Log axes for predicted-vs-actual", tt == "log1p", key="reg_logax")
     a, b = st.columns(2)
-    f = px.scatter(x=yt, y=yp, opacity=.45, labels={"x": "Actual $Worldwide (USD)", "y": "Predicted (USD)"}, title="Predicted vs actual", log_x=logax, log_y=logax, color_discrete_sequence=[PAL[1]])
+    f = px.scatter(x=yt, y=yp, opacity=.45, labels={"x": f"Actual ({data['target_col']})", "y": "Predicted"},
+                   title="Predicted vs actual", log_x=logax, log_y=logax, color_discrete_sequence=[PAL[1]])
     lo, hi = max(float(min(yt.min(), 1)), 1), float(yt.max())
     f.add_trace(go.Scatter(x=[lo, hi], y=[lo, hi], mode="lines", name="Perfect prediction", line=dict(dash="dash", color="black")))
     a.plotly_chart(f.update_layout(height=400), width="stretch")
-    f = px.scatter(x=yp, y=resid, opacity=.45, labels={"x": "Predicted (USD)", "y": "Residual (actual − predicted)"}, title="Residual plot", color_discrete_sequence=[PAL[0]])
+    f = px.scatter(x=yp, y=resid, opacity=.45, labels={"x": "Predicted", "y": "Residual (actual − predicted)"},
+                   title="Residual plot", color_discrete_sequence=[PAL[0]])
     f.add_hline(y=0, line_dash="dash", line_color="black")
     b.plotly_chart(f.update_layout(height=400), width="stretch")
     with st.spinner("Computing feature importance…"):
         imp, title = S.reg_importance(res, data)
     st.plotly_chart(importance_fig(imp, title), width="stretch")
+
+    # Prediction form
     st.subheader("🔮 Predict with this model")
-    X = data["X_train"]
     with st.form("reg_pred"):
-        c1, c2, c3 = st.columns(3)
-        year = c1.number_input("Release year", 1990, 2035, 2018); rating = c2.slider("Rating (0-10)", 0.0, 10.0, 6.5, 0.1)
-        votes = c3.number_input("Vote count", 0, 5_000_000, int(X["Vote_Count"].median()), step=100)
-        c1, c2, c3, c4 = st.columns(4)
-        genre = c1.selectbox("Primary genre", data["genres"]); lang = c2.selectbox("Language", data["languages"])
-        ng = c3.number_input("Number of genres", 1, 8, 2); nc = c4.number_input("Number of production countries", 1, 8, 1)
-        ok = st.form_submit_button("Predict worldwide gross")
+        cols_per_row = 3
+        form_cols = st.columns(cols_per_row)
+        vals = {}
+        all_feats = data["num_cols"] + data["cat_cols"]
+        for i, feat in enumerate(all_feats):
+            c = form_cols[i % cols_per_row]
+            if feat in data["num_cols"]:
+                col_data = data["X_train"][feat]
+                vals[feat] = c.number_input(feat, value=float(col_data.median()),
+                                            min_value=float(col_data.min()) - abs(float(col_data.std())),
+                                            max_value=float(col_data.max()) + abs(float(col_data.std())),
+                                            key=f"reg_pred_{feat}")
+            else:
+                unique_vals = data["X_train"][feat].dropna().unique().tolist()[:50]
+                vals[feat] = c.selectbox(feat, unique_vals, key=f"reg_pred_{feat}")
+        ok = st.form_submit_button("Predict target value")
     if ok:
-        row = pd.DataFrame([{"Primary_Genre": genre, "Language_Grouped": lang, "Decade": f"{int(year)//10*10}s", "Year": year, "Rating_numeric": rating,
-                             "Vote_Count": votes, "Genre_Count": ng, "Country_Count": nc}])
         try:
-            pred = float(np.expm1(np.clip(res["pipe"].predict(row)[0], -50, 50)))
-            st.success(f"Predicted worldwide gross: **${pred:,.0f}** ({name})")
-            if f"{int(year)//10*10}s" not in data["decade_order"]:
-                st.warning("This decade was not in the training data, so it is encoded as an unknown value.")
+            row = pd.DataFrame([vals])
+            pred_val = res["pipe"].predict(row[all_feats])[0]
+            if data.get("target_transform") == "log1p":
+                pred_val = float(np.expm1(np.clip(pred_val, -50, 50)))
+            st.success(f"Predicted **{data['target_col']}**: **{pred_val:,.4f}** ({name})")
         except Exception as e:  # noqa: BLE001
             st.error(f"Prediction failed: {e}")
 
@@ -309,7 +388,7 @@ def _reg_model(name, data, dkey):
 def _reg_compare(data, dkey):
     n = len(S.REG_SPECS)
     explain_reg_metrics()
-    st.markdown(f"Trains **all {n} algorithms** on the same split and ranks them by R² (USD). 5-fold CV is added for the two best.")
+    st.markdown(f"Trains **all {n} algorithms** on the same split and ranks them by R². 5-fold CV is added for the two best.")
     cmode = st.radio("Mode", ["Quick (default hyperparameters)", "Tuned (GridSearchCV for every model — slower)"], horizontal=True, key="reg_cmode")
     if st.button(f"▶ Run all {n} algorithms", type="primary", key="reg_all"):
         tune_all, rows, bar = cmode.startswith("Tuned"), [], st.progress(0.0)
@@ -323,16 +402,16 @@ def _reg_compare(data, dkey):
             tbl = ranked_table(rows, "R2"); cvs = {}
             for nm in tbl["Model"].head(2):
                 cvs[nm] = c_reg_run(nm, json.dumps(S.build_params(S.REG_SPECS[nm]["spec"], {}), default=str), dkey, tune_all, True, data)["cv"]
-            tbl["CV R² (5-fold, log)"] = tbl["Model"].map(lambda x: float(cvs[x].mean()) if x in cvs else np.nan)
+            tbl["CV R² (5-fold)"] = tbl["Model"].map(lambda x: float(cvs[x].mean()) if x in cvs else np.nan)
             st.session_state["reg_table"] = tbl; bar.empty()
         except Exception as e:  # noqa: BLE001
             bar.empty(); st.error(f"Comparison failed: {e}")
     tbl = st.session_state.get("reg_table")
     if tbl is None:
         return
-    st.dataframe(tbl.style.format({"R2": "{:.4f}", "RMSE": "{:,.0f}", "MAE": "{:,.0f}", "R2_log": "{:.4f}", "CV R² (5-fold, log)": "{:.4f}"}, na_rep="—"), width="stretch", hide_index=True)
+    st.dataframe(tbl.style.format({"R2": "{:.4f}", "RMSE": "{:,.2f}", "MAE": "{:,.2f}", "R2_log": "{:.4f}", "CV R² (5-fold)": "{:.4f}"}, na_rep="—"), width="stretch", hide_index=True)
     a, b = st.columns(2)
-    for col, key, title in [(a, "R2", "R² (USD) by model"), (b, "R2_log", "R² (log scale) by model")]:
+    for col, key, title in [(a, "R2", "R² by model"), (b, "R2_log", "R² (log scale) by model")]:
         col.plotly_chart(px.bar(tbl, x=key, y="Model", orientation="h", title=title, color="Model", color_discrete_sequence=PAL).update_layout(showlegend=False, height=420, yaxis=dict(autorange="reversed")), width="stretch")
     st.download_button("⬇ Download comparison (CSV)", tbl.to_csv(index=False).encode(), "regression_comparison.csv", "text/csv")
 
@@ -341,49 +420,67 @@ def _reg_compare(data, dkey):
 def _classification(view, hero):
     active = S.clf_active(); n = len(active)
     parts = "Part A" if n == 5 else "Part A + Part B"
-    hero(f"Classification · {view_label('Classification', view)}", f"{n} algorithms ({parts}) · obesity level · weighted metrics, confusion matrix, ROC-AUC (OvR)")
-    raw, src = get_upload_or_default("Upload Obesity CSV", "clf_up",
-        "Please upload the obesity classification CSV (e.g. ObesityDataSet_raw_and_data_sinthetic.csv) in the sidebar to begin.")
+    hero(f"Classification · {view_label('Classification', view)}", f"{n} algorithms ({parts}) · auto-detects features from your CSV · weighted metrics, confusion matrix, ROC-AUC (OvR)")
+    raw, src = get_upload("Upload CSV for Classification", "clf_up")
     if raw is None:
         return
+
+    target_col, feature_cols = column_selectors(raw, "Classification", "clf")
+    if not feature_cols:
+        st.warning("Select at least one feature column in the sidebar.")
+        return
+
     test_size = st.sidebar.slider("Test set fraction", 0.1, 0.4, 0.2, 0.05, key="clf_ts")
     try:
-        data = c_clf_prepare(raw, test_size)
+        data = c_clf_prepare(raw, target_col, tuple(feature_cols), test_size)
     except Exception as e:  # noqa: BLE001
         st.error(f"Could not prepare the data: {e}")
         return
-    dkey = f"{pd.util.hash_pandas_object(raw, index=False).sum()}_{test_size}"
+    dkey = f"{pd.util.hash_pandas_object(raw, index=False).sum()}_{target_col}_{test_size}"
     a, b, c, d = st.columns(4)
     a.metric("Rows", f"{data['meta']['rows']:,}"); b.metric("Classes", len(data["classes"])); c.metric("Train rows", len(data["X_train"])); d.metric("Test rows", len(data["X_test"]))
-    st.caption(f"Source: {src}. Stratified split, random_state=42; scaler fitted on the training set only (no leakage).")
+    st.caption(f"Source: {src}. Target: `{target_col}` ({len(data['classes'])} classes) | Features: {len(data['num_cols'])} numeric, {len(data['cat_cols'])} categorical | "
+               f"Stratified split, random_state=42; scaler fitted on the training set only (no leakage).")
     if view == "Dataset & EDA":
-        _clf_eda(raw)
+        _clf_eda(raw, data, target_col)
     elif view == "Compare all algorithms":
         _clf_compare(data, dkey)
     else:
         _clf_model(view, data, dkey)
 
 
-def _clf_eda(raw):
-    st.markdown("**Preprocessing:** engineered `BMI = Weight / Height²`; `CAEC`, `CALC` ordinal-encoded (no < Sometimes < Frequently < Always); binary columns mapped to 0/1; "
-                "`MTRANS` one-hot encoded; numeric columns standardised (scaler fitted on the training set).")
+def _clf_eda(raw, data, target_col):
+    st.markdown("**Preprocessing:** Numeric features are median-imputed and standardised. Categorical features are one-hot encoded. "
+                "All preprocessing happens inside the pipeline (fitted on training data only).")
     st.dataframe(raw.head(15), width="stretch")
-    vc = raw["NObeyesdad"].value_counts().reset_index(); vc.columns = ["Class", "Count"]
-    st.plotly_chart(px.bar(vc, x="Class", y="Count", color="Class", color_discrete_sequence=PAL, title="Target class distribution").update_layout(showlegend=False, height=380), width="stretch")
-    enc = S.clf_encode(raw.drop(columns=["NObeyesdad"])); num = S.CLF_SCALE
-    st.plotly_chart(px.imshow(enc[num].corr().round(2), color_continuous_scale="RdBu_r", zmin=-1, zmax=1, text_auto=True, title="Correlation heatmap: numeric features").update_layout(height=520), width="stretch")
-    feat = st.selectbox("Feature vs class", num, key="clf_eda_feat")
-    st.plotly_chart(px.box(raw.assign(BMI=enc["BMI"]), x="NObeyesdad", y=feat, color="NObeyesdad", color_discrete_sequence=PAL, title=f"{feat} by obesity level").update_layout(showlegend=False, height=420, xaxis_title="Class"), width="stretch")
+
+    # Target distribution
+    vc = raw[target_col].value_counts().reset_index(); vc.columns = ["Class", "Count"]
+    st.plotly_chart(px.bar(vc, x="Class", y="Count", color="Class", color_discrete_sequence=PAL,
+                           title="Target class distribution").update_layout(showlegend=False, height=380), width="stretch")
+
+    # Correlation heatmap for numeric features
+    if data["num_cols"]:
+        num_data = data["X_train"][[c for c in data["columns"] if c.startswith("num__")]] if any(c.startswith("num__") for c in data["columns"]) else data["X_train"]
+        if len(num_data.columns) > 1:
+            st.plotly_chart(px.imshow(num_data.corr().round(2), color_continuous_scale="RdBu_r", zmin=-1, zmax=1, text_auto=True,
+                                      title="Correlation heatmap: processed features").update_layout(height=520), width="stretch")
+
+    # Feature vs class boxplot
+    num_features_in_raw = [c for c in data["num_cols"] if c in raw.columns]
+    if num_features_in_raw:
+        feat = st.selectbox("Feature vs class", num_features_in_raw, key="clf_eda_feat")
+        st.plotly_chart(px.box(raw, x=target_col, y=feat, color=target_col, color_discrete_sequence=PAL,
+                               title=f"{feat} by {target_col}").update_layout(showlegend=False, height=420, xaxis_title="Class"),
+                       width="stretch")
 
 
 def _clf_model(name, data, dkey):
     spec, classes = S.CLF_SPECS[name], data["classes"]
     explain_clf_metrics()
     if spec["part"] == "B":
-        st.caption("Part B grids are defaults chosen by this app (not from your Part A notebooks).")
+        st.caption("Part B grids are defaults chosen by this app.")
     clicked, pjson, tune, want_cv = train_controls("clf", name, spec)
-    if tune and name in ("Logistic Regression", "Naive Bayes (Gaussian)"):
-        st.caption("Note: your Part A notebooks used default settings for this model; this grid is an extra.")
     if clicked:
         try:
             with st.spinner(f"Training {name}…" + (" (grid search can take a while)" if tune else "")):
@@ -405,7 +502,6 @@ def _clf_model(name, data, dkey):
     if name == "K-Nearest Neighbors":
         curve = c_knn_curve(data["X_train"], data["y_train"], getattr(res["model"], "metric", "euclidean"))
         st.plotly_chart(px.line(curve, x="k", y="cv_f1", markers=True, title="KNN: 5-fold CV weighted F1 vs k (training set)", labels={"cv_f1": "CV weighted F1"}).update_layout(height=360), width="stretch")
-        st.caption("Features are standardised, so distances are comparable; unscaled data would let large-range features dominate.")
     if name == "Decision Tree Classifier":
         depth = st.slider("Tree depth to draw", 1, 6, 3, key="clf_tree_depth")
         fig, ax = plt.subplots(figsize=(18, 7)); plot_tree(res["model"], max_depth=depth, feature_names=data["columns"], class_names=classes, filled=True, rounded=True, fontsize=7, ax=ax)
@@ -413,28 +509,33 @@ def _clf_model(name, data, dkey):
     if name == "Logistic Regression":
         coef = pd.DataFrame(res["model"].coef_, index=classes, columns=data["columns"])
         st.plotly_chart(px.imshow(coef.round(2), color_continuous_scale="RdBu_r", aspect="auto", text_auto=True, title="Logistic Regression coefficients per class (scaled features)").update_layout(height=420), width="stretch")
-    st.subheader("🔮 Classify a new person with this model")
+
+    # Dynamic prediction form
+    st.subheader("🔮 Classify a new observation with this model")
     with st.form("clf_pred"):
-        c = st.columns(4)
-        g = c[0].selectbox("Gender", ["Female", "Male"]); age = c[1].number_input("Age", 10, 80, 25)
-        h = c[2].number_input("Height (m)", 1.2, 2.2, 1.70, 0.01); w = c[3].number_input("Weight (kg)", 30.0, 200.0, 70.0, 0.5)
-        c = st.columns(4)
-        fh = c[0].selectbox("Family history of overweight", ["yes", "no"]); favc = c[1].selectbox("Frequent high-calorie food (FAVC)", ["yes", "no"])
-        caec = c[2].selectbox("Snacking between meals (CAEC)", S.FREQ, index=1); calc = c[3].selectbox("Alcohol (CALC)", S.FREQ, index=1)
-        c = st.columns(4)
-        fcvc = c[0].slider("Vegetable frequency (FCVC)", 1.0, 3.0, 2.0, 0.1); ncp = c[1].slider("Main meals/day (NCP)", 1.0, 4.0, 3.0, 0.1)
-        ch2o = c[2].slider("Water intake (CH2O)", 1.0, 3.0, 2.0, 0.1); faf = c[3].slider("Physical activity (FAF)", 0.0, 3.0, 1.0, 0.1)
-        c = st.columns(4)
-        tue = c[0].slider("Screen time (TUE)", 0.0, 2.0, 1.0, 0.1); smoke = c[1].selectbox("Smokes", ["no", "yes"]); scc = c[2].selectbox("Monitors calories (SCC)", ["no", "yes"])
-        mt = c[3].selectbox("Transport (MTRANS)", ["Public_Transportation", "Walking", "Automobile", "Motorbike", "Bike"])
+        cols_per_row = 4
+        form_cols = st.columns(cols_per_row)
+        vals = {}
+        all_feats = data["num_cols"] + data["cat_cols"]
+        for i, feat in enumerate(all_feats):
+            c = form_cols[i % cols_per_row]
+            raw_col = data["raw"][feat] if feat in data["raw"].columns else None
+            if feat in data["num_cols"] and raw_col is not None:
+                col_numeric = pd.to_numeric(raw_col, errors="coerce")
+                vals[feat] = c.number_input(feat, value=float(col_numeric.median()),
+                                            key=f"clf_pred_{feat}")
+            elif raw_col is not None:
+                unique_vals = raw_col.dropna().unique().tolist()[:50]
+                vals[feat] = c.selectbox(feat, unique_vals, key=f"clf_pred_{feat}")
+            else:
+                vals[feat] = c.text_input(feat, key=f"clf_pred_{feat}")
         ok = st.form_submit_button("Classify")
     if ok:
-        row = dict(Age=age, Gender=g, Height=h, Weight=w, CALC=calc, FAVC=favc, FCVC=fcvc, NCP=ncp, SCC=scc, SMOKE=smoke, CH2O=ch2o,
-                   family_history_with_overweight=fh, FAF=faf, TUE=tue, CAEC=caec, MTRANS=mt)
         try:
-            k, p = S.clf_predict_row(res, data, row)
-            st.success(f"Predicted class: **{classes[k].replace('_', ' ')}** (BMI {w / h ** 2:.1f}; {name})")
-            st.plotly_chart(px.bar(x=classes, y=p, labels={"x": "Class", "y": "Probability"}, title="Class probabilities", color_discrete_sequence=[PAL[0]]).update_layout(height=360), width="stretch")
+            k, p = S.clf_predict_row(res, data, vals)
+            st.success(f"Predicted class: **{classes[k]}** ({name})")
+            st.plotly_chart(px.bar(x=classes, y=p, labels={"x": "Class", "y": "Probability"}, title="Class probabilities",
+                                   color_discrete_sequence=[PAL[0]]).update_layout(height=360), width="stretch")
         except Exception as e:  # noqa: BLE001
             st.error(f"Prediction failed: {e}")
 

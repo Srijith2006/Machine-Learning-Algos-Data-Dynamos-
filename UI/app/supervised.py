@@ -1,6 +1,6 @@
 """Regression (10 algorithms) and classification (Part A: 5, Part B: 5) engines.
-Pipelines replicate the uploaded notebooks: box-office regression (log1p target, metrics in USD) and
-Obesity classification (BMI feature, ordinal/binary/one-hot encoding, stratified split, scaler fitted on train only)."""
+Now fully generic: works with ANY uploaded CSV. The user picks target and feature columns;
+pipelines auto-detect numeric vs categorical and build imputation/encoding/scaling dynamically."""
 import ast
 import os
 from pathlib import Path
@@ -27,12 +27,6 @@ from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
 
 SEED = 42
 DATA = Path(__file__).resolve().parent.parent / "data"
-def box_path():
-    """Default box-office CSV; override with the BOX_OFFICE_CSV environment variable."""
-    return Path(os.environ.get("BOX_OFFICE_CSV", DATA / "enhanced_box_office_data_2000-2024.csv"))
-
-
-OB_PATH = DATA / "ObesityDataSet_raw_and_data_sinthetic.csv"
 
 
 # ============================== parameter spec helpers ==============================
@@ -58,15 +52,10 @@ def defaults(spec):
 
 
 # ================================== REGRESSION ======================================
-REG_REQUIRED = ["Year", "$Worldwide", "Rating", "Vote_Count", "Genres", "Production_Countries", "Original_Language"]
-REG_LEAK = ["$Domestic", "Domestic %", "$Foreign", "Foreign %", "Rank", "Release Group", "Rating"]
-REG_CAT, REG_ORD = ["Primary_Genre", "Language_Grouped"], ["Decade"]
-REG_NUM = ["Year", "Rating_numeric", "Vote_Count", "Genre_Count", "Country_Count"]
-
 
 class NumericPolyExpander(BaseEstimator, TransformerMixin):
     """PolynomialFeatures on the first n_numeric (numeric) columns; encoded categoricals pass through."""
-    def __init__(self, degree=2, n_numeric=len(REG_NUM)):
+    def __init__(self, degree=2, n_numeric=5):
         self.degree, self.n_numeric = degree, n_numeric
 
     def fit(self, X, y=None):
@@ -111,75 +100,115 @@ REG_SPECS = {
 }
 
 
-def reg_prepare(raw, test_size=0.2):
-    miss = [c for c in REG_REQUIRED if c not in raw.columns]
-    if miss:
-        raise ValueError(f"CSV is missing required columns: {miss}")
+def reg_prepare(raw, target_col, feature_cols, test_size=0.2, log_target=True):
+    """Generic regression data preparation.
+    Auto-detects numeric vs categorical features and builds column lists for the pipeline.
+    """
+    if target_col not in raw.columns:
+        raise ValueError(f"Target column '{target_col}' not found in the CSV.")
+    miss_feats = [c for c in feature_cols if c not in raw.columns]
+    if miss_feats:
+        raise ValueError(f"Feature columns not found: {miss_feats}")
+    if not feature_cols:
+        raise ValueError("Select at least one feature column.")
+
     d = raw.copy()
-    d["Rating_numeric"] = pd.to_numeric(d["Rating"].astype(str).str.split("/").str[0], errors="coerce")
-    d["Vote_Count"] = pd.to_numeric(d["Vote_Count"], errors="coerce")
-    d = d.drop(columns=[c for c in REG_LEAK if c in d.columns])        # leakage columns removed, as in the notebooks
-    n0 = len(d); d = d.drop_duplicates().copy(); dups = n0 - len(d)
-    d["$Worldwide"] = pd.to_numeric(d["$Worldwide"], errors="coerce")
-    d = d[d["$Worldwide"].notna() & (d["$Worldwide"] >= 0)]
-    d["Genres"] = d["Genres"].fillna("Unknown")
-    d["Genre_Count"] = d["Genres"].apply(lambda x: len(str(x).split(",")))
-    d["Primary_Genre"] = d["Genres"].apply(lambda x: str(x).split(",")[0].strip())
-    d["Production_Countries"] = d["Production_Countries"].fillna("Unknown")
-    d["Country_Count"] = d["Production_Countries"].apply(lambda x: len(str(x).split(",")))
-    d["Original_Language"] = d["Original_Language"].fillna("Unknown")
-    top = d["Original_Language"].value_counts().nlargest(8).index
-    d["Language_Grouped"] = d["Original_Language"].where(d["Original_Language"].isin(top), "Other")
-    d["Decade"] = (d["Year"] // 10 * 10).astype(int).astype(str) + "s"
-    if len(d) < 50:
-        raise ValueError("Fewer than 50 usable rows after cleaning.")
-    X = d[REG_CAT + REG_ORD + REG_NUM]; y = np.log1p(d["$Worldwide"])
+    # Clean target
+    d[target_col] = pd.to_numeric(d[target_col], errors="coerce")
+    n0 = len(d)
+    d = d.dropna(subset=[target_col])
+    d = d.drop_duplicates().copy()
+    dups = n0 - len(d)
+
+    if len(d) < 30:
+        raise ValueError(f"Only {len(d)} usable rows after cleaning (need at least 30).")
+
+    # Separate numeric and categorical features
+    num_cols = []
+    cat_cols = []
+    for c in feature_cols:
+        if c == target_col:
+            continue
+        col_data = pd.to_numeric(d[c], errors="coerce")
+        if col_data.notna().sum() > len(d) * 0.5:  # >50% parseable as numeric
+            num_cols.append(c)
+            d[c] = col_data
+        else:
+            cat_cols.append(c)
+
+    if not num_cols and not cat_cols:
+        raise ValueError("No usable feature columns found.")
+
+    # Target transform
+    y_raw = d[target_col].values
+    if log_target and (y_raw > 0).all():
+        y = np.log1p(y_raw)
+        target_transform = "log1p"
+    else:
+        y = y_raw.astype(float)
+        target_transform = "none"
+
+    X = d[num_cols + cat_cols]
     Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=test_size, random_state=SEED)
-    return dict(X_train=Xtr, X_test=Xte, y_train=ytr, y_test=yte, meta=dict(rows_raw=len(raw), duplicates=dups, rows=len(d)),
-                decade_order=sorted(X["Decade"].unique(), key=lambda s: int(s[:-1])),
-                genres=sorted(X["Primary_Genre"].unique()), languages=sorted(X["Language_Grouped"].unique()))
+
+    return dict(
+        X_train=Xtr, X_test=Xte, y_train=ytr, y_test=yte,
+        num_cols=num_cols, cat_cols=cat_cols,
+        target_col=target_col, target_transform=target_transform,
+        meta=dict(rows_raw=len(raw), duplicates=dups, rows=len(d)),
+    )
 
 
-def _reg_pre(decade_order):
-    num = Pipeline([("imputer", SimpleImputer(strategy="median")), ("scaler", StandardScaler())])
-    cat = Pipeline([("imputer", SimpleImputer(strategy="constant", fill_value="Unknown")),
-                    ("encoder", OneHotEncoder(handle_unknown="ignore", min_frequency=0.02, sparse_output=False))])
-    od = Pipeline([("imputer", SimpleImputer(strategy="most_frequent")),
-                   ("encoder", OrdinalEncoder(categories=[decade_order], handle_unknown="use_encoded_value", unknown_value=-1))])
-    return ColumnTransformer([("num", num, REG_NUM), ("cat", cat, REG_CAT), ("ord", od, REG_ORD)])
+def _reg_pre(num_cols, cat_cols):
+    """Build a generic preprocessing ColumnTransformer."""
+    transformers = []
+    if num_cols:
+        num_pipe = Pipeline([("imputer", SimpleImputer(strategy="median")), ("scaler", StandardScaler())])
+        transformers.append(("num", num_pipe, num_cols))
+    if cat_cols:
+        cat_pipe = Pipeline([("imputer", SimpleImputer(strategy="constant", fill_value="Unknown")),
+                        ("encoder", OneHotEncoder(handle_unknown="ignore", min_frequency=0.02, sparse_output=False))])
+        transformers.append(("cat", cat_pipe, cat_cols))
+    return ColumnTransformer(transformers)
 
 
-def reg_pipeline(name, params, decade_order):
+def reg_pipeline(name, params, data):
     s = REG_SPECS[name]
-    steps = [("preprocessor", _reg_pre(decade_order))]
+    num_cols, cat_cols = data["num_cols"], data["cat_cols"]
+    steps = [("preprocessor", _reg_pre(num_cols, cat_cols))]
     if s.get("poly"):
-        steps.append(("poly", NumericPolyExpander(degree=int(params.get("degree", 2)))))
+        steps.append(("poly", NumericPolyExpander(degree=int(params.get("degree", 2)), n_numeric=len(num_cols))))
         steps.append(("model", s["cls"](**s["fixed"])))
     else:
         steps.append(("model", s["cls"](**s["fixed"], **params)))
     return Pipeline(steps)
 
 
-def reg_metrics(y_true_log, y_pred_log):
-    yt, yp = np.expm1(y_true_log), np.expm1(np.clip(y_pred_log, -50, 50))
-    return dict(R2=r2_score(yt, yp), RMSE=float(np.sqrt(mean_squared_error(yt, yp))), MAE=mean_absolute_error(yt, yp),
-                R2_log=r2_score(y_true_log, y_pred_log))
+def reg_metrics(y_true, y_pred, target_transform="none"):
+    if target_transform == "log1p":
+        yt, yp = np.expm1(y_true), np.expm1(np.clip(y_pred, -50, 50))
+        return dict(R2=r2_score(yt, yp), RMSE=float(np.sqrt(mean_squared_error(yt, yp))),
+                    MAE=mean_absolute_error(yt, yp), R2_log=r2_score(y_true, y_pred))
+    else:
+        return dict(R2=r2_score(y_true, y_pred), RMSE=float(np.sqrt(mean_squared_error(y_true, y_pred))),
+                    MAE=mean_absolute_error(y_true, y_pred), R2_log=r2_score(y_true, y_pred))
 
 
 def reg_run(name, params, data, tune=False, cv_scores=False):
-    """Fit one regression pipeline. tune=True runs the notebook's GridSearchCV (5-fold, scoring r2 on the log target)."""
-    s, order = REG_SPECS[name], data["decade_order"]
+    """Fit one regression pipeline. tune=True runs GridSearchCV (5-fold, scoring r2)."""
+    s = REG_SPECS[name]
     Xtr, ytr, Xte, yte = data["X_train"], data["y_train"], data["X_test"], data["y_test"]
+    tt = data.get("target_transform", "none")
     out = {"name": name}
-    base = reg_pipeline(name, defaults_params(s), order).fit(Xtr, ytr)
-    out["baseline"] = reg_metrics(yte, base.predict(Xte))
+    base = reg_pipeline(name, defaults_params(s), data).fit(Xtr, ytr)
+    out["baseline"] = reg_metrics(yte, base.predict(Xte), tt)
     if tune:
-        g = GridSearchCV(reg_pipeline(name, defaults_params(s), order), s["grid"], scoring="r2", cv=5, n_jobs=-1).fit(Xtr, ytr)
+        g = GridSearchCV(reg_pipeline(name, defaults_params(s), data), s["grid"], scoring="r2", cv=5, n_jobs=-1).fit(Xtr, ytr)
         pipe, out["best_params"], out["cv_best"] = g.best_estimator_, g.best_params_, g.best_score_
     else:
-        pipe = reg_pipeline(name, params, order).fit(Xtr, ytr)
+        pipe = reg_pipeline(name, params, data).fit(Xtr, ytr)
     pred = pipe.predict(Xte)
-    out.update(pipe=pipe, metrics=reg_metrics(yte, pred), pred_log=pred)
+    out.update(pipe=pipe, metrics=reg_metrics(yte, pred, tt), pred_log=pred)
     if cv_scores:
         out["cv"] = cross_val_score(pipe, Xtr, ytr, scoring="r2", cv=KFold(5, shuffle=True, random_state=SEED), n_jobs=-1)
     return out
@@ -200,17 +229,13 @@ def reg_importance(res, data):
         return pd.DataFrame({"feature": names, "importance": m.feature_importances_}).nlargest(12, "importance"), "Native feature importance"
     if hasattr(m, "coef_") and names is not None and np.ravel(m.coef_).shape[0] == len(names):
         c = np.ravel(m.coef_)
-        return pd.DataFrame({"feature": names, "importance": c}).reindex(pd.Series(np.abs(c)).nlargest(12).index), "Coefficients (scaled log-target units)"
+        return pd.DataFrame({"feature": names, "importance": c}).reindex(pd.Series(np.abs(c)).nlargest(12).index), "Coefficients (scaled units)"
     r = permutation_importance(pipe, data["X_test"], data["y_test"], n_repeats=5, random_state=SEED, scoring="r2")
-    return pd.DataFrame({"feature": data["X_test"].columns, "importance": r.importances_mean}).sort_values("importance", ascending=False), "Permutation importance (drop in R² when shuffled)"
+    feat_names = list(data["num_cols"]) + list(data["cat_cols"])
+    return pd.DataFrame({"feature": feat_names, "importance": r.importances_mean}).sort_values("importance", ascending=False), "Permutation importance (drop in R² when shuffled)"
 
 
 # ================================ CLASSIFICATION ====================================
-CLF_REQUIRED = ["Age", "Gender", "Height", "Weight", "CALC", "FAVC", "FCVC", "NCP", "SCC", "SMOKE", "CH2O",
-                "family_history_with_overweight", "FAF", "TUE", "CAEC", "MTRANS", "NObeyesdad"]
-CLF_SCALE = ["Age", "Height", "Weight", "FCVC", "NCP", "CH2O", "FAF", "TUE", "BMI"]
-MTRANS_CATS = ["Automobile", "Bike", "Motorbike", "Public_Transportation", "Walking"]
-FREQ = ["no", "Sometimes", "Frequently", "Always"]
 
 HL = ["(100,)", "(50,)", "(100, 50)", "(64, 32)"]
 CLF_SPECS = {
@@ -256,43 +281,94 @@ def clf_active():
     return {n: v for n, v in CLF_SPECS.items() if INCLUDE_PART_B or v["part"] == "A"}
 
 
-def clf_encode(df):
-    """Stateless encoding identical to the notebook (usable on the whole table and on a single new row)."""
-    d = df.copy()
-    d["BMI"] = d["Weight"] / (d["Height"] ** 2)
-    for c in ["CAEC", "CALC"]:
-        d[c] = d[c].map({v: float(i) for i, v in enumerate(FREQ)}).fillna(-1.0)
-    d["Gender"] = d["Gender"].map({"Male": 1, "Female": 0})
-    for c in ["family_history_with_overweight", "FAVC", "SMOKE", "SCC"]:
-        d[c] = d[c].map({"yes": 1, "no": 0})
-    d = pd.get_dummies(d, columns=["MTRANS"], prefix="MTRANS", dtype=int)
-    for m in MTRANS_CATS:
-        if f"MTRANS_{m}" not in d.columns:
-            d[f"MTRANS_{m}"] = 0
-    return d
+def clf_prepare(raw, target_col, feature_cols, test_size=0.2):
+    """Generic classification data preparation.
+    Auto-detects numeric vs categorical features and builds a pipeline-ready dataset.
+    """
+    if target_col not in raw.columns:
+        raise ValueError(f"Target column '{target_col}' not found in the CSV.")
+    miss_feats = [c for c in feature_cols if c not in raw.columns]
+    if miss_feats:
+        raise ValueError(f"Feature columns not found: {miss_feats}")
+    if not feature_cols:
+        raise ValueError("Select at least one feature column.")
 
+    d = raw.dropna(subset=[target_col]).drop_duplicates().copy()
+    if len(d) < 30:
+        raise ValueError(f"Only {len(d)} usable rows after cleaning (need at least 30).")
 
-def clf_prepare(raw, test_size=0.2):
-    miss = [c for c in CLF_REQUIRED if c not in raw.columns]
-    if miss:
-        raise ValueError(f"CSV is missing required columns: {miss}")
-    d = clf_encode(raw.drop(columns=["NObeyesdad"]))
-    if d.isna().any().any():
-        raise ValueError("Unexpected category values found while encoding (check Gender/yes-no/CAEC/CALC columns).")
-    le = LabelEncoder(); y = pd.Series(le.fit_transform(raw["NObeyesdad"]), name="target")
-    Xtr, Xte, ytr, yte = train_test_split(d, y, test_size=test_size, random_state=SEED, stratify=y)
-    sc = StandardScaler(); Xtr, Xte = Xtr.copy(), Xte.copy()
-    Xtr[CLF_SCALE] = sc.fit_transform(Xtr[CLF_SCALE])        # fit on TRAIN only
-    Xte[CLF_SCALE] = sc.transform(Xte[CLF_SCALE])
-    return dict(X_train=Xtr, X_test=Xte, y_train=ytr, y_test=yte, scaler=sc, classes=list(le.classes_), columns=list(Xtr.columns),
-                meta=dict(rows=len(raw), duplicates=int(raw.duplicated().sum())), raw=raw)
+    # Encode target
+    le = LabelEncoder()
+    y = pd.Series(le.fit_transform(d[target_col].astype(str)), name="target", index=d.index)
+
+    # Separate numeric and categorical features
+    num_cols = []
+    cat_cols = []
+    for c in feature_cols:
+        if c == target_col:
+            continue
+        col_data = pd.to_numeric(d[c], errors="coerce")
+        if col_data.notna().sum() > len(d) * 0.5:
+            num_cols.append(c)
+        else:
+            cat_cols.append(c)
+
+    if not num_cols and not cat_cols:
+        raise ValueError("No usable feature columns found.")
+
+    # Build preprocessing pipeline
+    transformers = []
+    if num_cols:
+        num_pipe = Pipeline([("imputer", SimpleImputer(strategy="median")), ("scaler", StandardScaler())])
+        transformers.append(("num", num_pipe, num_cols))
+    if cat_cols:
+        cat_pipe = Pipeline([("imputer", SimpleImputer(strategy="constant", fill_value="Unknown")),
+                        ("encoder", OneHotEncoder(handle_unknown="ignore", min_frequency=0.02, sparse_output=False))])
+        transformers.append(("cat", cat_pipe, cat_cols))
+    preprocessor = ColumnTransformer(transformers)
+
+    X = d[num_cols + cat_cols]
+    Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=test_size, random_state=SEED, stratify=y)
+
+    # Fit preprocessor on training data only
+    Xtr_processed = preprocessor.fit_transform(Xtr)
+    Xte_processed = preprocessor.transform(Xte)
+
+    try:
+        col_names = list(preprocessor.get_feature_names_out())
+    except Exception:
+        col_names = [f"feature_{i}" for i in range(Xtr_processed.shape[1])]
+
+    Xtr_df = pd.DataFrame(Xtr_processed, columns=col_names, index=Xtr.index)
+    Xte_df = pd.DataFrame(Xte_processed, columns=col_names, index=Xte.index)
+
+    return dict(
+        X_train=Xtr_df, X_test=Xte_df, y_train=ytr, y_test=yte,
+        preprocessor=preprocessor,
+        num_cols=num_cols, cat_cols=cat_cols,
+        classes=list(le.classes_), columns=col_names,
+        label_encoder=le,
+        meta=dict(rows=len(d), duplicates=int(raw.duplicated().sum())),
+        raw=raw
+    )
 
 
 def clf_metrics(y_true, y_pred, proba, n_classes):
-    yb = label_binarize(y_true, classes=list(range(n_classes)))
-    return dict(Accuracy=accuracy_score(y_true, y_pred), Precision=precision_score(y_true, y_pred, average="weighted", zero_division=0),
-                Recall=recall_score(y_true, y_pred, average="weighted", zero_division=0), F1=f1_score(y_true, y_pred, average="weighted"),
-                ROC_AUC=roc_auc_score(yb, proba, multi_class="ovr", average="weighted"))
+    result = dict(
+        Accuracy=accuracy_score(y_true, y_pred),
+        Precision=precision_score(y_true, y_pred, average="weighted", zero_division=0),
+        Recall=recall_score(y_true, y_pred, average="weighted", zero_division=0),
+        F1=f1_score(y_true, y_pred, average="weighted"),
+    )
+    try:
+        yb = label_binarize(y_true, classes=list(range(n_classes)))
+        if yb.shape[1] == 1:
+            # Binary case: label_binarize returns single column
+            yb = np.hstack([1 - yb, yb])
+        result["ROC_AUC"] = roc_auc_score(yb, proba, multi_class="ovr", average="weighted")
+    except Exception:
+        result["ROC_AUC"] = float("nan")
+    return result
 
 
 def clf_estimator(name, params):
@@ -326,14 +402,16 @@ def clf_importance(res, data):
     if hasattr(m, "feature_importances_"):
         return pd.DataFrame({"feature": cols, "importance": m.feature_importances_}).nlargest(12, "importance"), "Native feature importance"
     if hasattr(m, "coef_"):
-        c = np.abs(m.coef_).mean(axis=0)
+        c = np.abs(m.coef_).mean(axis=0) if m.coef_.ndim > 1 else np.abs(m.coef_)
         return pd.DataFrame({"feature": cols, "importance": c}).nlargest(12, "importance"), "Mean |coefficient| across classes"
     r = permutation_importance(m, data["X_test"], data["y_test"], n_repeats=3, random_state=SEED, scoring="f1_weighted")
     return pd.DataFrame({"feature": cols, "importance": r.importances_mean}).nlargest(12, "importance"), "Permutation importance (drop in weighted F1)"
 
 
-def clf_predict_row(res, data, row: dict):
-    d = clf_encode(pd.DataFrame([row]))[data["columns"]].astype(float)
-    d[CLF_SCALE] = data["scaler"].transform(d[CLF_SCALE])
-    p = res["model"].predict_proba(d)[0]
+def clf_predict_row(res, data, row_values):
+    """Predict a single row. row_values is a dict of raw feature values."""
+    row_df = pd.DataFrame([row_values])
+    X_processed = data["preprocessor"].transform(row_df[data["num_cols"] + data["cat_cols"]])
+    X_df = pd.DataFrame(X_processed, columns=data["columns"])
+    p = res["model"].predict_proba(X_df)[0]
     return int(np.argmax(p)), p
